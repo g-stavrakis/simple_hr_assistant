@@ -1,0 +1,38 @@
+[project]
+name = "simple-rag"
+version = "0.1.0"
+description = "Minimal hybrid RAG demo with LangGraph, OpenAI, Qdrant, and LangSmith."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastembed>=0.8.0",
+    "langchain",
+    "langchain-community",
+    "langchain-core",
+    "langchain-openai",
+    "langchain-qdrant",
+    "langchain-text-splitters",
+    "langgraph",
+    "langgraph-cli[inmem]>=0.4.21",
+    "langsmith",
+    "pydantic-settings",
+    "pypdf",
+    "python-dotenv",
+    "qdrant-client",
+]
+
+[project.optional-dependencies]
+hybrid = [
+    "fastembed",
+]
+
+[project.scripts]
+rag-ingest = "app.ingestion.ingest:main"
+rag-chat = "app.rag.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
