@@ -12,6 +12,7 @@ except ImportError:
 
 
 def resolve_retrieval_config() -> tuple[RetrievalMode, dict[str, Any]]:
+    # Fall back to dense-only retrieval when the sparse dependency is unavailable.
     if FastEmbedSparse is None:
         warnings.warn(
             "FastEmbed is not installed; falling back to dense retrieval. "
@@ -27,4 +28,5 @@ def resolve_retrieval_config() -> tuple[RetrievalMode, dict[str, Any]]:
 
 
 def retrieval_mode_label(mode: RetrievalMode) -> str:
+    # Keep the human-readable mode label in one place for CLI output.
     return "hybrid" if mode == RetrievalMode.HYBRID else "dense"

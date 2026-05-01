@@ -1,96 +1,118 @@
 from __future__ import annotations
 
-import re
-from typing import Any
+from typing import Any, Literal
 
-from langchain_core.documents import Document
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
 
 from app.rag.utils.state import RAGState
-from app.rag.utils.tools import get_retriever, llm
+from app.rag.utils.tools import get_complaint_form, get_retriever, llm
 
-retriever = get_retriever()
+ALLOWED_CATEGORIES = [
+    "benefits",
+    "complain_form",
+    "finance",
+    "handbook",
+    "leave",
+    "onboarding",
+    "performance",
+    "security",
+    "training",
+    "travel",
+]
+
+IntentType = Literal["agent", "retrieve"]
+CategoryType = Literal[
+    "benefits",
+    "complain_form",
+    "finance",
+    "handbook",
+    "leave",
+    "onboarding",
+    "performance",
+    "security",
+    "training",
+    "travel",
+    "none",
+]
 
 
-def _active_query(state: RAGState) -> str:
-    if state.get("rewritten_question"):
-        return state["rewritten_question"]
-    else:
-        return state["question"]
+class DetectIntentOutput(BaseModel):
+    intent: IntentType = Field(
+        description="Whether the request should go to the complaint-form agent or retrieval."
+    )
+    category: CategoryType = Field(
+        description="The best matching document category, or `none` if no category applies."
+    )
 
 
-def _keywords(text: str) -> set[str]:
-    return {
-        token
-        for token in re.findall(r"[a-z0-9]+", text.lower())
-        if len(token) >= 4
-    }
-
-
-def _llm_grade_retrieval(question: str, docs: list[Document]) -> bool:
-    context = "\n\n".join(doc.page_content[:500] for doc in docs[:3])
+def detect_intent(state: RAGState) -> dict[str, Any]:
+    # Use structured output so intent/category validation happens via Pydantic.
     prompt = ChatPromptTemplate.from_template(
         """
-You are grading whether retrieved context is sufficient to answer a question.
-Answer only yes or no.
+You classify user questions for a company policy assistant.
+
+First decide the intent:
+- `agent` for complaint form or complaint submission requests
+- `retrieve` for policy and handbook questions
+
+If the intent is `retrieve`, also choose exactly one category from this list:
+{categories}
+
+If none is a strong fit, use `none` as the category.
 
 Question: {question}
-
-Retrieved context:
-{context}
-
-Is the context relevant and sufficient to answer the question?
 """.strip()
     )
-    decision = (prompt | llm).invoke({"question": question, "context": context}).content
-    return decision.strip().lower().startswith("y")
+    structured_llm = llm.with_structured_output(DetectIntentOutput)
+    result = (prompt | structured_llm).invoke(
+        {
+            "categories": ", ".join(ALLOWED_CATEGORIES),
+            "question": state["question"],
+        }
+    )
+
+    # Normalize `none` into the empty state used by downstream retrieval logic.
+    category = None if result.category == "none" else result.category
+    return {"intent": result.intent, "category": category}
+
+
+def rewrite_query_for_retrieval(state: RAGState) -> dict[str, Any]:
+    # Rewrite the original user wording into a tighter retrieval query.
+    prompt = ChatPromptTemplate.from_template(
+        """
+You rewrite user questions to improve retrieval for a company policy RAG system.
+Preserve the original meaning.
+Make the query specific and keyword-rich.
+Use the detected category when it helps focus the query.
+Return only the rewritten query.
+
+Detected category: {category}
+Original question: {question}
+""".strip()
+    )
+    rewritten = (
+        prompt | llm
+    ).invoke(
+        {
+            "question": state["question"],
+            "category": state.get("category") or "none",
+        }
+    ).content.strip()
+    return {"rewritten_question": rewritten}
 
 
 def retrieve(state: RAGState) -> dict[str, Any]:
-    query = _active_query(state)
+    # Search with the rewritten query when available, scoped by category metadata.
+    query = state.get("rewritten_question") or state["question"]
+    retriever = get_retriever(category=state.get("category"))
     docs = retriever.invoke(query)
     return {"documents": docs}
 
 
-def grade_retrieval(state: RAGState) -> dict[str, Any]:
-    docs = state.get("documents", [])
-    if not docs:
-        return {"retrieval_ok": False}
-
-    question_keywords = _keywords(state["question"])
-    if not question_keywords:
-        return {"retrieval_ok": _llm_grade_retrieval(state["question"], docs)}
-
-    top_docs_text = " ".join(doc.page_content for doc in docs[:3]).lower()
-    matched_keywords = sum(1 for keyword in question_keywords if keyword in top_docs_text)
-    match_ratio = matched_keywords / len(question_keywords)
-    enough_text = sum(len(doc.page_content) for doc in docs[:3]) >= 250
-
-    if matched_keywords >= 2 or match_ratio >= 0.5:
-        return {"retrieval_ok": enough_text}
-
-    if matched_keywords == 0:
-        return {"retrieval_ok": False}
-
-    return {"retrieval_ok": _llm_grade_retrieval(state["question"], docs)}
-
-
-def rewrite_query(state: RAGState) -> dict[str, Any]:
-    prompt = ChatPromptTemplate.from_template(
-        """
-You rewrite user questions to improve retrieval for a hybrid RAG system.
-Preserve the original meaning.
-Make the query specific and keyword-rich.
-Return only the rewritten query.
-
-Original question: {question}
-""".strip()
-    )
-    rewritten = (prompt | llm).invoke({"question": state["question"]}).content.strip()
-    return {"rewritten_question": rewritten}
-
-
 def generate(state: RAGState) -> dict[str, Any]:
+    # Build a single context block from the retrieved chunks before answering.
     context = "\n\n".join(
         f"[Source {i+1}]\n{doc.page_content}" for i, doc in enumerate(state["documents"])
     )
@@ -114,9 +136,40 @@ Question:
     return {"answer": answer}
 
 
-def route_after_grade(state: RAGState) -> str:
-    if state["retrieval_ok"]:
-        return "generate"
-    if state.get("rewritten_question"):
-        return "generate"
-    return "rewrite_query"
+def agent(state: RAGState) -> dict[str, Any]:
+    """Agent node that serves complaint form requests."""
+    # Bind the complaint-form tool for requests that should bypass retrieval.
+    llm_with_tools = llm.bind_tools([get_complaint_form])
+
+    messages = [
+        SystemMessage(
+            content=(
+                "You are a helpful HR assistant. "
+                "Use the complaint form tool whenever the user asks for a complaint form, "
+                "wants to submit a complaint, or asks how to structure a complaint."
+            )
+        ),
+        HumanMessage(content=state["question"])
+    ]
+
+    response = llm_with_tools.invoke(messages)
+
+    # Execute the first tool call when the model chooses the complaint form tool.
+    if hasattr(response, 'tool_calls') and response.tool_calls:
+        tool_call = response.tool_calls[0]
+        if tool_call['name'] == 'get_complaint_form':
+            answer = get_complaint_form.invoke(tool_call['args'])
+        else:
+            answer = "Tool not recognized"
+    else:
+        answer = response.content
+
+    return {"answer": answer}
+
+
+def route_question(state: RAGState) -> str:
+    # Complaint-form traffic goes to the agent; everything else continues to retrieval.
+    if state.get("intent") == "agent" or state.get("category") == "complain_form":
+        return "agent"
+
+    return "retrieve"

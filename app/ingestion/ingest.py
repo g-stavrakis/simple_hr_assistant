@@ -4,6 +4,7 @@ import shutil
 from pathlib import Path
 
 from langchain_community.document_loaders import DirectoryLoader, PyPDFLoader, TextLoader
+from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
 from langchain_qdrant import QdrantVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -17,7 +18,41 @@ SUPPORTED_TEXT_GLOBS = ["**/*.md", "**/*.txt"]
 SUPPORTED_PDF_GLOB = "**/*.pdf"
 
 
+def _relative_source_path(doc: Document) -> Path | None:
+    # Normalize loader paths so category extraction works for relative and absolute sources.
+    source = doc.metadata.get("source")
+    if not source:
+        return None
+
+    source_path = Path(source)
+    try:
+        return source_path.relative_to(DATA_DIR.resolve())
+    except ValueError:
+        try:
+            return source_path.resolve().relative_to(DATA_DIR.resolve())
+        except ValueError:
+            return None
+
+
+def add_document_metadata(docs: list[Document]) -> list[Document]:
+    # Copy folder-derived metadata onto each document before chunking.
+    for doc in docs:
+        relative_path = _relative_source_path(doc)
+        if relative_path is None:
+            continue
+
+        parent_parts = relative_path.parts[:-1]
+        category = parent_parts[0] if parent_parts else "uncategorized"
+
+        doc.metadata["category"] = category
+        doc.metadata["document_name"] = relative_path.stem
+        doc.metadata["source_path"] = str(relative_path)
+
+    return docs
+
+
 def load_documents():
+    # Load supported text files and PDFs from the demo corpus.
     docs = []
 
     for pattern in SUPPORTED_TEXT_GLOBS:
@@ -51,7 +86,8 @@ def load_documents():
 def main() -> None:
     settings = get_settings()
 
-    docs = load_documents()
+    # Enrich raw documents before splitting so each chunk inherits the metadata.
+    docs = add_document_metadata(load_documents())
     splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
     chunks = splitter.split_documents(docs)
 
@@ -66,6 +102,7 @@ def main() -> None:
     if qdrant_path.exists():
         shutil.rmtree(qdrant_path)
 
+    # Index the chunked documents into the local Qdrant collection.
     QdrantVectorStore.from_documents(
         documents=chunks,
         embedding=dense_embeddings,

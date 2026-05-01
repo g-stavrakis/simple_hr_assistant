@@ -3,11 +3,12 @@ from __future__ import annotations
 from langgraph.graph import END, StateGraph
 
 from app.rag.utils.nodes import (
+    agent,
+    detect_intent,
     generate,
-    grade_retrieval,
     retrieve,
-    rewrite_query,
-    route_after_grade,
+    route_question,
+    rewrite_query_for_retrieval,
 )
 from app.rag.utils.state import RAGState
 
@@ -15,22 +16,27 @@ from app.rag.utils.state import RAGState
 def build_graph():
     builder = StateGraph(RAGState)
 
+    # Register the core graph steps.
+    builder.add_node("detect_intent", detect_intent)
+    builder.add_node("rewrite_query_for_retrieval", rewrite_query_for_retrieval)
     builder.add_node("retrieve", retrieve)
-    builder.add_node("grade_retrieval", grade_retrieval)
-    builder.add_node("rewrite_query", rewrite_query)
     builder.add_node("generate", generate)
+    builder.add_node("agent", agent)
 
-    builder.set_entry_point("retrieve")
-    builder.add_edge("retrieve", "grade_retrieval")
+    # Start by deciding whether this is a retrieval or complaint-form request.
+    builder.set_entry_point("detect_intent")
     builder.add_conditional_edges(
-        "grade_retrieval",
-        route_after_grade,
+        "detect_intent",
+        route_question,
         {
-            "generate": "generate",
-            "rewrite_query": "rewrite_query",
+            "agent": "agent",
+            "retrieve": "rewrite_query_for_retrieval",
         },
     )
-    builder.add_edge("rewrite_query", "retrieve")
+    # Retrieval requests are rewritten, searched, and then answered from context.
+    builder.add_edge("rewrite_query_for_retrieval", "retrieve")
+    builder.add_edge("retrieve", "generate")
     builder.add_edge("generate", END)
+    builder.add_edge("agent", END)
 
     return builder.compile()

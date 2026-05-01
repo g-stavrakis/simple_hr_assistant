@@ -28,6 +28,7 @@ hybrid = [
 
 [project.scripts]
 rag-ingest = "app.ingestion.ingest:main"
+rag-search = "app.ingestion.query:main"
 rag-chat = "app.rag.main:main"
 
 [build-system]
